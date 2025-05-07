@@ -1,0 +1,6 @@
+requests
+async-upnp-client
+xmltodict
+aiohttp
+ping3
+yt-dlp
