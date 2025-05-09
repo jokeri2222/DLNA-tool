@@ -26,7 +26,6 @@ if os.path.exists(requirements_path):
 
 
 import asyncio
-from importlib.metadata import metadata
 import requests
 from async_upnp_client.search import async_search
 import tkinter as tk
@@ -34,7 +33,6 @@ from tkinter import ttk, Menu, filedialog
 import xmltodict
 import threading
 from aiohttp import web
-import os
 import socket
 from async_upnp_client.aiohttp import AiohttpRequester
 from async_upnp_client.client_factory import UpnpFactory
@@ -114,76 +112,56 @@ class FileServer:
         return f"http://{get_local_ip()}:{self.port}/files/{filename}?v={int(time.time())}"
 
 
-def generate_media_metadata(file_path):
-    """
-    Automatically generates metadata for video and image files.
-
-    :param file_path: The file path of the media (image or video)
-    :return: A string containing the metadata in XML format
-    """
-    # Get file extension
-    file_extension = os.path.splitext(file_path)[1].lower()
-
-    # Define basic metadata structure
-    metadata = f"""
-    <item xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">
-        <dc:title>{os.path.basename(file_path)}</dc:title>
-        <dc:creator>Unknown</dc:creator>
-    """
-
-    # Add specific metadata depending on file type
-    if file_extension in ['.mp4', '.avi', '.mkv', '.mov']:
-        # Video metadata
-        metadata += f"""
-        <upnp:class>object.item.videoItem.movie</upnp:class>
-        <res protocolInfo="http-get:*:video/*:*">{file_path}</res>
-        """
-    elif file_extension in ['.jpg', '.jpeg', '.png', '.bmp', '.gif']:
-        # Image metadata
-        metadata += f"""
-        <upnp:class>object.item.imageItem.photo</upnp:class>
-        <res protocolInfo="http-get:*:image/*:*">{file_path}</res>
-        """
-    else:
-        # Unsupported file type, return empty metadata
-        return None
-
-    # Close metadata XML structure
-    metadata += "</item>"
-
-    return metadata
-
 file_server = FileServer(port=8000)
 
 # ---- DLNA Commands ----
-async def send_dlna_stream_command(device_url, media_url, metadata):
+async def send_dlna_stream_command(device_url, media_url, loop_forever=True):
     requester = AiohttpRequester()
     factory = UpnpFactory(requester)
-
     device = await factory.async_create_device(device_url)
     av_transport = device.service("urn:schemas-upnp-org:service:AVTransport:1")
 
-    await av_transport.action("SetAVTransportURI").async_call(
-        InstanceID=0,
-        CurrentURI=media_url,
-        CurrentURIMetaData=metadata
-    )
+    async def play_video():
+        await av_transport.action("SetAVTransportURI").async_call(
+            InstanceID=0,
+            CurrentURI=media_url,
+            CurrentURIMetaData=""
+        )
+        await av_transport.action("Play").async_call(
+            InstanceID=0,
+            Speed="1"
+        )
 
-    await av_transport.action("Play").async_call(
-        InstanceID=0,
-        Speed="1"
-    )
+    await play_video()
+
+    if loop_forever:
+        async def loop_forever_task():
+            while True:
+                result = await av_transport.action("GetTransportInfo").async_call(InstanceID=0)
+                if result["CurrentTransportState"] == "STOPPED":
+                    print("[LOOP] Video ended, restarting...")
+                    await play_video()
+
+        task = asyncio.create_task(loop_forever_task())
+        stream_tasks[device_url] = task
+
 
 async def stop_dlna_stream_command(device_url):
+    # Cancel the loop task if it's running
+    task = stream_tasks.pop(device_url, None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            print(f"[LOOP] Streaming loop cancelled for {device_url}")
+
     requester = AiohttpRequester()
     factory = UpnpFactory(requester)
-
     device = await factory.async_create_device(device_url)
     av_transport = device.service("urn:schemas-upnp-org:service:AVTransport:1")
 
-    await av_transport.action("Stop").async_call(
-        InstanceID=0
-    )
+    await av_transport.action("Stop").async_call(InstanceID=0)
 
 async def browse_media_server(device_url, object_id="0"):
     requester = AiohttpRequester()
@@ -206,6 +184,7 @@ async def browse_media_server(device_url, object_id="0"):
 
 # ---- Device Tracking and GUI ----
 known_locations = set()
+stream_tasks = {}
 categorized_devices = {
     "Media Centers": [],
     "Screens": [],
@@ -314,8 +293,7 @@ def stream_file_to_device(device, filetypes, media_type):
     async def stream():
         filename = file_server.add_file(file_path)
         media_url = file_server.url_for(filename)
-        metadata=generate_media_metadata(file_path)
-        await send_dlna_stream_command(device["Location"], media_url, metadata)
+        await send_dlna_stream_command(device["Location"], media_url)
 
     asyncio.run_coroutine_threadsafe(stream(), loop)
 
